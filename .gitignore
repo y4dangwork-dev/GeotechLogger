@@ -1,34 +1,95 @@
-# Gradle files
+# =========================================================
+# 🔧 GRADLE / ANDROID BUILD FILES
+# =========================================================
 .gradle/
+**/.gradle/
 build/
+*/build/
 
-# Local configuration file (sdk path, etc)
+# Local configuration (SDK path, etc)
 local.properties
 
-# Log/OS Files
-*.log
-
-# Android Studio generated files and folders
+# Android generated files
 captures/
 .externalNativeBuild/
 .cxx/
-*.aab
+
+# Output files
 *.apk
+*.aab
 output-metadata.json
 
-# IntelliJ
-*.iml
+# =========================================================
+# 📱 ANDROID STUDIO / INTELLIJ
+# =========================================================
 .idea/
+*.iml
+*.iws
+*.ipr
+
 misc.xml
 deploymentTargetDropDown.xml
 render.experimental.xml
 
-# Keystore files
+# =========================================================
+# 🔐 KEYS / SIGNING (CRITICAL SECURITY)
+# =========================================================
 *.jks
 *.keystore
+keystore.properties
 
-# Google Services (e.g. APIs or Firebase)
+# =========================================================
+# 🌐 SUPABASE (VERY IMPORTANT)
+# =========================================================
+# Environment variables
+.env
+.env.*
+supabase/.env
+
+# Supabase CLI local state
+.supabase/
+
+# Supabase config (if used locally)
+supabase/config.toml
+
+# =========================================================
+# 🔑 API KEYS / CLOUD CONFIGS
+# =========================================================
 google-services.json
+firebase-config.json
 
-# Android Profiling
+# =========================================================
+# 📊 LOGS / CRASH REPORTS
+# =========================================================
+*.log
+logcat.txt
 *.hprof
+
+# =========================================================
+# 💻 JAVA / KOTLIN BUILD ARTIFACTS
+# =========================================================
+*.class
+*.jar
+
+# =========================================================
+# 🖥 SYSTEM FILES
+# =========================================================
+.DS_Store
+Thumbs.db
+
+# =========================================================
+# 🧪 TEMP / CACHE
+# =========================================================
+*.tmp
+*.temp
+*.lock
+
+# =========================================================
+# 🧰 OPTIONAL (GEO / ENGINEERING APP FILES)
+# =========================================================
+*.las
+*.laz
+*.csv~
+*.bak
+*.dwg
+*.dxf
