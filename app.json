@@ -1,0 +1,48 @@
+{
+  "expo": {
+    "name": "GeoTechLogger",
+    "slug": "geotechlogger",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "image": "./assets/splash.png",
+      "backgroundColor": "#1F3A5F"
+    },
+    "ios": {
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Used to centre the map on your current site location.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "Used to centre the map on your current site location."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#1F3A5F"
+      },
+      "package": "com.geopacific.geotechlogger",
+      "permissions": [
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.INTERNET",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION"
+      ]
+    },
+    "plugins": [
+      "expo-file-system",
+      "expo-location"
+    ],
+    "assetBundlePatterns": [
+      "assets/**"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "21d99898-32ec-4be5-a406-923662942f7d"
+      }
+    }
+  }
+}
