@@ -627,6 +627,7 @@ export async function renderBorehole(job, borehole) {
   }
 
   const dcptData = borehole.dcpt || entries.flatMap(e => e.dcptRows || []);
+  const fcData   = borehole.fc  || [];
 
   // Pagination — short borehole: scale to actual depth+1m
   const effectiveDepth = totalDepth < K.MAX_PER_PAGE
@@ -672,6 +673,7 @@ export async function renderBorehole(job, borehole) {
       descBot = drawDescriptions(pageEntries);
     }
     drawDcpt(dcptData);
+    drawFc(fcData);
     drawGroundwater(borehole.groundwaterDepth);
     if (pageEntries.length) drawRemarks(pageEntries);
     const gndElev = parseFloat(borehole.groundElevation);

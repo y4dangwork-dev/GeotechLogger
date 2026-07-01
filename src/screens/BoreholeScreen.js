@@ -138,7 +138,7 @@ export default function BoreholeScreen({ route, navigation }) {
     };
     setLoading(true);
     try {
-      const bhWithDcpt = { ...borehole, dcpt: dcpt.map(r => [r.depth, r.blows]) };
+      const bhWithDcpt = { ...borehole, dcpt: dcpt.map(r => [r.depth, r.blows]), fc };
       const pdfBytes   = await renderBorehole(effectiveJob, bhWithDcpt);
       const filename   = `borehole_${borehole.boreholeNumber || 'log'}.pdf`;
 
