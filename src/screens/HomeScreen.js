@@ -8,7 +8,10 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 import { DB } from '../storage/db';
 import { MapPickerView } from '../components/MapPickerModal';
-// import { getCommunityJobs, getCommunityJobDetail, publishJob as supabasePublish, unpublishJob } from '../lib/supabase'; // SERVER_DISABLED
+import { getCommunityJobs, getCommunityJobDetail, publishJob as supabasePublish, unpublishJob, logActivity, isAdmin as checkIsAdmin } from '../lib/supabase';
+import { supabase } from '../lib/supabaseClient';
+
+const SYNC_INTERVAL_MS = 10000; // auto-sync Community tab every 10s while focused
 
 // Resolve the best coordinates for a community job:
 // 1. Job-level GPS  2. First borehole with GPS  3. null
@@ -43,6 +46,17 @@ L.tileLayer('https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
   {attribution:'&copy; Google',maxZoom:21}).addTo(map);
 
 var markers = {};
+var searchMarker = null;
+
+function setSearchPin(lat, lng, label) {
+  if (searchMarker) { map.removeLayer(searchMarker); searchMarker = null; }
+  searchMarker = L.marker([lat, lng], { opacity: 0.9 }).addTo(map);
+  if (label) searchMarker.bindPopup(label).openPopup();
+}
+
+function clearSearchPin() {
+  if (searchMarker) { map.removeLayer(searchMarker); searchMarker = null; }
+}
 
 function loadPins(pins) {
   Object.values(markers).forEach(function(m){map.removeLayer(m);});
@@ -88,7 +102,7 @@ function buildPinData(jobs) {
   }).filter(Boolean);
 }
 
-function CommunityMapView({ jobs, focusJob, onSelectJob }) {
+function CommunityMapView({ jobs, focusJob, searchPin, onSelectJob }) {
   const [mapReady, setMapReady] = useState(false); // useState so useEffect re-fires
   const webViewRef = React.useRef(null);
 
@@ -108,6 +122,16 @@ function CommunityMapView({ jobs, focusJob, onSelectJob }) {
     if (!coords) return;
     inject(`map.flyTo([${coords.lat},${coords.lng}],13,{animate:true,duration:0.8})`);
   }, [focusJob, mapReady]);
+
+  // Fly to + drop a pin on a searched location (e.g. "Sydney", an address, etc.)
+  // that isn't necessarily where any published job is.
+  React.useEffect(() => {
+    if (!mapReady) return;
+    if (!searchPin) { inject('clearSearchPin()'); return; }
+    const { lat, lng, label } = searchPin;
+    inject(`setSearchPin(${lat},${lng},${JSON.stringify(label || '')})`);
+    inject(`map.flyTo([${lat},${lng}],13,{animate:true,duration:0.8})`);
+  }, [searchPin, mapReady]);
 
   function onMapLoad() {
     setTimeout(() => setMapReady(true), 600);
@@ -164,6 +188,21 @@ export default function HomeScreen({ navigation }) {
   const [nearbyEnabled, setNearbyEnabled] = useState(false);
   const [nearbyRadius,  setNearbyRadius]  = useState(3);
 
+  // Community tab
+  const [tab,           setTab]           = useState('mine'); // 'mine' | 'community'
+  const [commJobs,       setCommJobs]      = useState([]);
+  const [commSearch,     setCommSearch]    = useState('');
+  const [commLoading,    setCommLoading]   = useState(false);
+  const [commError,      setCommError]     = useState(null);
+  const [focusJob,        setFocusJob]      = useState(null);
+  const [deviceId,        setDeviceId]      = useState(null);
+  const [userId,          setUserId]        = useState(null); // signed-in user's id (real ownership)
+  const [geoResult,       setGeoResult]      = useState(null); // { lat, lng, label } for a searched place
+  const [geoLoading,      setGeoLoading]     = useState(false);
+  const [isUserAdmin,     setIsUserAdmin]    = useState(false); // this account is on the server admins allow-list
+  const [adminMode,       setAdminMode]      = useState(false); // off by default even for admins — must be switched on
+  const syncTimerRef = useRef(null);
+
   useFocusEffect(useCallback(() => {
     DB.getJobs().then(setJobs);
     DB.getSettings().then(s => {
@@ -171,6 +210,24 @@ export default function HomeScreen({ navigation }) {
       setNearbyRadius(s.nearbyRefRadius);
     });
   }, []));
+
+  // Legacy device id — still sent alongside owner_user_id for jobs published
+  // before login existed, but ownership is now really decided by owner_user_id
+  // (checked both here for UX and, authoritatively, by RLS on the server).
+  useEffect(() => { DB.getDeviceId().then(setDeviceId); }, []);
+  useEffect(() => {
+    supabase.auth.getUser()
+      .then(({ data }) => setUserId(data?.user?.id || null))
+      .catch(() => setUserId(null)); // e.g. offline — fine, just means no ownership checks apply
+  }, []);
+  // Ask the server whether this signed-in account is on the admins
+  // allow-list (supabase_admin_setup.sql). The allow-list itself never
+  // reaches the client — just this yes/no. adminMode stays off even for an
+  // admin account until they flip the switch, so an accidental tap on
+  // someone else's job can't edit/delete it by mistake.
+  useEffect(() => {
+    checkIsAdmin().then(setIsUserAdmin).catch(() => setIsUserAdmin(false));
+  }, [userId]);
 
   function toggleNearby(val) {
     setNearbyEnabled(val);
@@ -181,11 +238,179 @@ export default function HomeScreen({ navigation }) {
     DB.updateSettings({ nearbyRefRadius: r });
   }
 
-  /* SERVER_DISABLED — community functions removed
-  async function loadCommunity() { ... }
-  async function publishJob(job) { ... }
-  async function openCommunityJob(j) { ... }
-  */
+  // Distance in km between two lat/lng points.
+  function haversineKm(lat1, lng1, lat2, lng2) {
+    const R = 6371;
+    const toRad = d => d * Math.PI / 180;
+    const dLat = toRad(lat2 - lat1), dLng = toRad(lng2 - lng1);
+    const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+
+  // When a text search on Community turns up nothing, try treating it as a
+  // place name instead (e.g. "Burnaby", "123 Main St") — geocode it via
+  // OpenStreetMap's free Nominatim service (no API key needed), fly the map
+  // there, and show any published jobs within 1km of that point.
+  async function geocodeCommSearch(query) {
+    const q = query.trim();
+    if (!q) { setGeoResult(null); return; }
+    setGeoLoading(true);
+    try {
+      const r = await fetch(
+        `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`,
+        { headers: { 'User-Agent': 'GeoTechLoggerApp (internal geotech field app)' } }
+      );
+      const rows = await r.json();
+      if (!rows.length) {
+        setGeoResult({ lat: null, lng: null, label: q });
+      } else {
+        setGeoResult({ lat: parseFloat(rows[0].lat), lng: parseFloat(rows[0].lon), label: rows[0].display_name || q });
+      }
+    } catch (e) {
+      setGeoResult({ lat: null, lng: null, label: q, error: e.message || 'Could not search location' });
+    } finally {
+      setGeoLoading(false);
+    }
+  }
+
+  function onCommSearchSubmit() {
+    if (filteredCommJobsForSearch(commSearch, commJobs).length > 0) {
+      setGeoResult(null); // exact text matches exist — no need to geocode
+      return;
+    }
+    geocodeCommSearch(commSearch);
+  }
+
+  function filteredCommJobsForSearch(query, list) {
+    const q = query.trim().toLowerCase();
+    if (!q) return list;
+    return list.filter(j =>
+      (j.job_number||'').toLowerCase().includes(q)
+      || (j.project_name||'').toLowerCase().includes(q)
+      || (j.client_name||'').toLowerCase().includes(q)
+      || (j.location_name||'').toLowerCase().includes(q)
+    );
+  }
+
+  // ── Community: load + publish + auto-sync every 10s while tab is focused ──
+  async function loadCommunity({ silent = false } = {}) {
+    if (!silent) setCommLoading(true);
+    setCommError(null);
+    try {
+      const rows = await getCommunityJobs();
+      setCommJobs(rows);
+    } catch (e) {
+      setCommError(e.message || 'Failed to load community jobs');
+    } finally {
+      if (!silent) setCommLoading(false);
+    }
+  }
+
+  async function doPublish(job, { isOverwrite = false } = {}) {
+    try {
+      const boreholes = job.boreholes || [];
+      await supabasePublish(job, boreholes, deviceId);
+      logActivity({
+        jobId: job.id, action: isOverwrite ? 'overwrite' : 'publish', deviceId,
+        jobNumber: job.jobNumber, projectName: job.projectName, boreholeCount: boreholes.length,
+      });
+      Alert.alert('Published', 'Job published to Community map.');
+      loadCommunity({ silent: true });
+    } catch (e) {
+      Alert.alert('Publish Failed', e.message || 'Could not publish job');
+    }
+  }
+
+  // Real ownership (owner_user_id, checked server-side by RLS) takes priority;
+  // owner_device_id is only a fallback for rows published before login existed.
+  function isOwnCommunityRecord(record) {
+    if (!record) return false;
+    // Admin Mode switched on: treat every record as editable/deletable.
+    // The server enforces this independently via is_admin() in RLS — this
+    // client-side check only controls whether the UI *offers* the buttons.
+    if (adminMode && isUserAdmin) return true;
+    if (record.owner_user_id) return userId != null && record.owner_user_id === userId;
+    if (record.owner_device_id) return deviceId != null && record.owner_device_id === deviceId;
+    return false;
+  }
+
+  async function publishJob(job) {
+    // Publishing is always a manual, explicit action — the server copy is
+    // never edited in place. If this job was published before, re-publishing
+    // overwrites its Community data (including boreholes), so confirm first.
+    let existing = null;
+    try { existing = await getCommunityJobDetail(job.id); } catch { /* treat as not-yet-published */ }
+
+    if (existing && (existing.borehole_count || 0) > 0) {
+      if ((existing.owner_user_id || existing.owner_device_id) && !isOwnCommunityRecord(existing)) {
+        Alert.alert(
+          'Not Your Published Job',
+          'This job appears to already be published by someone else. Overwriting it from here is not allowed.'
+        );
+        return;
+      }
+      Alert.alert(
+        'Overwrite Published Data?',
+        `This job is already published on the Community map with ${existing.borehole_count} borehole(s). ` +
+        'Publishing again will overwrite the existing Community copy with your current local data. Continue?',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Overwrite', style: 'destructive', onPress: () => doPublish(job, { isOverwrite: true }) },
+        ]
+      );
+      return;
+    }
+
+    doPublish(job);
+  }
+
+  async function unpublishCommunityJob(j) {
+    if ((j.owner_user_id || j.owner_device_id) && !isOwnCommunityRecord(j)) {
+      Alert.alert('Not Your Job', 'You can only remove jobs that you published.');
+      return;
+    }
+    Alert.alert('Remove from Community', 'Remove this job from the community map?',
+      [{ text:'Cancel', style:'cancel' }, { text:'Remove', style:'destructive',
+        onPress: async () => {
+          try {
+            await unpublishJob(j.id);
+            logActivity({
+              jobId: j.id, action: 'unpublish', deviceId,
+              jobNumber: j.job_number, projectName: j.project_name, boreholeCount: j.borehole_count,
+            });
+            loadCommunity({ silent: true });
+          }
+          catch (e) { Alert.alert('Error', e.message || 'Could not remove job'); }
+        }
+      }]);
+  }
+
+  async function openCommunityJob(j) {
+    try {
+      const detail = await getCommunityJobDetail(j.id);
+      // Community jobs are always view-only here — editing happens locally in
+      // "My Jobs", then gets pushed back up with the Publish button.
+      navigation.navigate('Job', { communityJob: detail || j, readOnly: true });
+    } catch (e) {
+      Alert.alert('Error', e.message || 'Could not open job');
+    }
+  }
+
+  // Auto-sync: poll Community list every 10s, only while Community tab is focused.
+  // Stops on tab switch / screen blur so it never runs in the background.
+  useFocusEffect(useCallback(() => {
+    if (tab !== 'community') return undefined;
+
+    loadCommunity();
+    syncTimerRef.current = setInterval(() => loadCommunity({ silent: true }), SYNC_INTERVAL_MS);
+
+    return () => {
+      if (syncTimerRef.current) {
+        clearInterval(syncTimerRef.current);
+        syncTimerRef.current = null;
+      }
+    };
+  }, [tab]));
 
   async function createJob() {
     if (!form.projectName.trim()) { Alert.alert('Required','Enter project name'); return; }
@@ -221,6 +446,28 @@ export default function HomeScreen({ navigation }) {
       }]);
   }
 
+  function signOut() {
+    Alert.alert('Sign Out', 'Sign out of GeoTechLogger?',
+      [{ text:'Cancel', style:'cancel' }, { text:'Sign Out', style:'destructive',
+        onPress: () => supabase.auth.signOut().catch(() => {})
+      }]);
+  }
+
+  const textMatchedCommJobs = filteredCommJobsForSearch(commSearch, commJobs);
+
+  // Jobs within 1km of a geocoded search location (only relevant once a text
+  // search comes up empty and we fell back to place-name search).
+  const nearbyGeoJobs = (geoResult?.lat != null)
+    ? commJobs.filter(j => {
+        const c = resolveJobCoords(j);
+        if (!c) return false;
+        return haversineKm(geoResult.lat, geoResult.lng, c.lat, c.lng) <= 1;
+      })
+    : [];
+
+  const usingGeoFallback = commSearch.trim() !== '' && textMatchedCommJobs.length === 0 && !!geoResult;
+  const filteredCommJobs = usingGeoFallback ? nearbyGeoJobs : textMatchedCommJobs;
+
   return (
     <SafeAreaView style={s.safe}>
       <StatusBar barStyle="light-content" backgroundColor={C.navy} />
@@ -247,12 +494,150 @@ export default function HomeScreen({ navigation }) {
       {/* ── Header ── */}
       <View style={s.header}>
         <Text style={s.headerTitle}>GeoTechLogger</Text>
+        <TouchableOpacity style={s.signOutBtn} onPress={signOut}>
+          <Text style={s.signOutTxt}>Sign Out</Text>
+        </TouchableOpacity>
         <TouchableOpacity style={s.addBtn} onPress={() => { setForm(BLANK); setModal(true); }}>
           <Text style={s.addBtnTxt}>+ New Job</Text>
         </TouchableOpacity>
       </View>
 
-      {/* ── My Jobs ── */}
+      {/* ── Tab Bar ── */}
+      <View style={s.tabBar}>
+        <TouchableOpacity
+          style={[s.tabBtn, tab === 'mine' && s.tabBtnActive]}
+          onPress={() => setTab('mine')}>
+          <Text style={[s.tabTxt, tab === 'mine' && s.tabTxtActive]}>My Jobs</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[s.tabBtn, tab === 'community' && s.tabBtnActive]}
+          onPress={() => setTab('community')}>
+          <Text style={[s.tabTxt, tab === 'community' && s.tabTxtActive]}>Community</Text>
+        </TouchableOpacity>
+      </View>
+
+      {tab === 'community' ? (
+        /* ── Community ── */
+        <View style={{flex:1}}>
+          {isUserAdmin && (
+            <View style={s.adminBar}>
+              <Text style={s.adminBarTxt}>
+                {adminMode ? 'Admin Mode — you can edit/delete any job' : 'Admin Mode'}
+              </Text>
+              <Switch
+                value={adminMode}
+                onValueChange={v => {
+                  if (v) {
+                    Alert.alert(
+                      'Turn On Admin Mode?',
+                      'You will be able to edit and delete any job published by anyone, not just your own.',
+                      [
+                        { text: 'Cancel', style: 'cancel' },
+                        { text: 'Turn On', style: 'destructive', onPress: () => setAdminMode(true) },
+                      ]
+                    );
+                  } else {
+                    setAdminMode(false);
+                  }
+                }}
+                trackColor={{ false: '#CBD5E1', true: '#DC2626' }}
+                thumbColor="#fff"
+              />
+            </View>
+          )}
+          <View style={s.searchBar}>
+            <TextInput
+              style={s.searchInput}
+              placeholder="Search job #, project, client, location... (press enter to search a place)"
+              placeholderTextColor={C.muted}
+              value={commSearch}
+              onChangeText={t => { setCommSearch(t); setGeoResult(null); }}
+              onSubmitEditing={onCommSearchSubmit}
+              returnKeyType="search"
+              clearButtonMode="while-editing"
+            />
+            {geoLoading && <ActivityIndicator size="small" color={C.blue} style={{marginLeft:8}} />}
+          </View>
+          {usingGeoFallback && (
+            <View style={s.geoBanner}>
+              <Text style={s.geoBannerTxt} numberOfLines={2}>
+                {geoResult.lat != null
+                  ? `📍 Showing jobs within 1km of "${geoResult.label}"`
+                  : geoResult.error
+                    ? `Could not search "${geoResult.label}": ${geoResult.error}`
+                    : `No location found for "${geoResult.label}"`}
+              </Text>
+            </View>
+          )}
+          <View style={s.mapBox}>
+            <CommunityMapView
+              jobs={filteredCommJobs}
+              focusJob={focusJob}
+              searchPin={geoResult?.lat != null ? geoResult : null}
+              onSelectJob={id => {
+                const j = filteredCommJobs.find(x => x.id === id);
+                if (j) setFocusJob(j);
+              }}
+            />
+          </View>
+          {commLoading ? (
+            <View style={s.commLoader}><ActivityIndicator color={C.blue} /></View>
+          ) : commError ? (
+            <View style={s.commLoader}>
+              <Text style={s.errTxt}>{commError}</Text>
+              <TouchableOpacity style={[s.btnPrimary,{marginTop:12,paddingHorizontal:20}]} onPress={() => loadCommunity()}>
+                <Text style={s.btnPrimaryTxt}>Retry</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <FlatList
+              style={s.commList}
+              data={filteredCommJobs}
+              keyExtractor={j => j.id}
+              ListEmptyComponent={
+                <View style={s.empty}>
+                  {usingGeoFallback && geoResult.lat != null ? (
+                    <>
+                      <Text style={s.emptyTxt}>No published jobs within 1km</Text>
+                      <Text style={s.emptySub}>of "{geoResult.label}"</Text>
+                    </>
+                  ) : commSearch ? (
+                    geoLoading
+                      ? <Text style={s.emptyTxt}>Searching…</Text>
+                      : <Text style={s.emptyTxt}>No results for "{commSearch}"</Text>
+                  ) : (
+                    <>
+                      <Text style={s.emptyTxt}>No published jobs yet</Text>
+                      <Text style={s.emptySub}>Publish a job from "My Jobs" to see it here</Text>
+                    </>
+                  )}
+                </View>
+              }
+              renderItem={({ item:j }) => (
+                <TouchableOpacity
+                  style={[s.commCard, focusJob?.id === j.id && s.commCardFocused]}
+                  onPress={() => openCommunityJob(j)}
+                  onLongPress={() => setFocusJob(j)}>
+                  <View style={[s.commDot, focusJob?.id === j.id && s.commDotFocused]} />
+                  <View style={{flex:1}}>
+                    <Text style={s.commTitle}>{j.job_number || '—'}</Text>
+                    <Text style={s.commProject}>{j.project_name}</Text>
+                    {j.client_name ? <Text style={s.commSub}>{j.client_name}</Text> : null}
+                    <Text style={s.commSub}>{j.borehole_count || 0} boreholes</Text>
+                  </View>
+                  {isOwnCommunityRecord(j) && (
+                    <TouchableOpacity onPress={() => unpublishCommunityJob(j)} style={s.iconBtn}>
+                      <Text style={s.delTxt}>✕</Text>
+                    </TouchableOpacity>
+                  )}
+                  <Text style={s.commArrow}>›</Text>
+                </TouchableOpacity>
+              )}
+            />
+          )}
+        </View>
+      ) : (
+      /* ── My Jobs ── */
       <View style={{flex:1}}>
           <View style={s.searchBar}>
             <TextInput
@@ -332,6 +717,9 @@ export default function HomeScreen({ navigation }) {
                   <Text style={s.cardBadge}>{(j.boreholes||[]).length} boreholes</Text>
                 </View>
                 <View style={s.actions}>
+                  <TouchableOpacity onPress={() => publishJob(j)} style={s.iconBtn}>
+                    <Text style={s.pubTxt}>⇪</Text>
+                  </TouchableOpacity>
                   <TouchableOpacity onPress={() => openEdit(j)} style={s.iconBtn}>
                     <Text style={s.editTxt}>✎</Text>
                   </TouchableOpacity>
@@ -343,6 +731,7 @@ export default function HomeScreen({ navigation }) {
             )}
           />
         </View>
+      )}
 
       {/* ── Create Modal ── */}
       <JobFormModal
@@ -432,6 +821,12 @@ const s = StyleSheet.create({
   headerTitle:  { flex:1, color:'#fff', fontSize:18, fontWeight:'bold' },
   addBtn:       { backgroundColor:'#fff', paddingHorizontal:14, paddingVertical:7, borderRadius:8 },
   addBtnTxt:    { color:C.navy, fontWeight:'bold', fontSize:13 },
+  signOutBtn:   { paddingHorizontal:10, paddingVertical:7, marginRight:8 },
+  signOutTxt:   { color:'rgba(255,255,255,0.7)', fontSize:12, textDecorationLine:'underline' },
+  adminBar:     { flexDirection:'row', alignItems:'center', justifyContent:'space-between',
+                  backgroundColor:'#FEF2F2', paddingHorizontal:14, paddingVertical:8,
+                  borderBottomWidth:1, borderBottomColor:'#FCA5A5' },
+  adminBarTxt:  { color:'#B91C1C', fontSize:12, fontWeight:'600', flex:1, marginRight:8 },
 
   tabBar:       { flexDirection:'row', backgroundColor:C.navy, paddingHorizontal:12, paddingBottom:8 },
   tabBtn:       { flex:1, paddingVertical:8, borderRadius:8, alignItems:'center' },
@@ -440,9 +835,13 @@ const s = StyleSheet.create({
   tabTxtActive: { color:'#fff' },
 
   // Search bar
-  searchBar:    { backgroundColor:C.navy, paddingHorizontal:12, paddingBottom:10, paddingTop:4 },
-  searchInput:  { backgroundColor:'rgba(255,255,255,0.15)', borderRadius:10, paddingHorizontal:14,
+  searchBar:    { backgroundColor:C.navy, paddingHorizontal:12, paddingBottom:10, paddingTop:4,
+                  flexDirection:'row', alignItems:'center' },
+  searchInput:  { flex:1, backgroundColor:'rgba(255,255,255,0.15)', borderRadius:10, paddingHorizontal:14,
                   paddingVertical:9, color:'#fff', fontSize:13 },
+  geoBanner:    { backgroundColor:'#EFF6FF', paddingHorizontal:14, paddingVertical:8,
+                  borderBottomWidth:1, borderBottomColor:C.border },
+  geoBannerTxt: { fontSize:12, color:C.navy, fontWeight:'600' },
 
   // Nearby Reference settings card
   settingsCard:       { backgroundColor:C.white, marginHorizontal:12, marginTop:10, marginBottom:2,

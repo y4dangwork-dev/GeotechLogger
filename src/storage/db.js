@@ -2,6 +2,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const JOBS_KEY     = '@geotechlogger:jobs';
 const SETTINGS_KEY = '@geotechlogger:settings';
+const DEVICE_ID_KEY = '@geotechlogger:deviceId';
+const OFFLINE_UNLOCK_KEY = '@geotechlogger:offlineUnlocked';
 
 const DEFAULT_SETTINGS = {
   nearbyRefEnabled: false,
@@ -38,6 +40,32 @@ async function saveJobs(jobs) {
 }
 
 export const DB = {
+  // Stable per-install identifier. Used to tag published Community jobs so we
+  // can tell "mine" (editable/removable) apart from "someone else's" (view-only).
+  // Not a real auth system — just a client-side ownership hint.
+  async getDeviceId() {
+    try {
+      let id = await AsyncStorage.getItem(DEVICE_ID_KEY);
+      if (!id) {
+        id = uuid();
+        await AsyncStorage.setItem(DEVICE_ID_KEY, id);
+      }
+      return id;
+    } catch { return uuid(); }
+  },
+
+  // Whether this device has ever entered the correct offline passcode.
+  // Offline mode has no server to check against, so this is a simple
+  // deterrent (stop a random phone from opening the app), not real security —
+  // once unlocked, this device stays unlocked for future offline sessions too.
+  async isOfflineUnlocked() {
+    try { return (await AsyncStorage.getItem(OFFLINE_UNLOCK_KEY)) === 'true'; }
+    catch { return false; }
+  },
+  async setOfflineUnlocked() {
+    try { await AsyncStorage.setItem(OFFLINE_UNLOCK_KEY, 'true'); } catch {}
+  },
+
   async getSettings() {
     try {
       const raw = await AsyncStorage.getItem(SETTINGS_KEY);
@@ -56,6 +84,30 @@ export const DB = {
     const jobs = await loadJobs();
     const job = { id: uuid(), ...data, boreholes: [], createdAt: Date.now() };
     jobs.unshift(job);
+    await saveJobs(jobs);
+    return job;
+  },
+
+  // Pulls a community job's published data down into local storage as an
+  // editable job with the SAME id as the community record, so the normal
+  // Publish flow (which upserts on job.id) later pushes changes back to the
+  // right row. Used by the "Download to My Jobs" action available to a
+  // community job's owner or an assigned EOR. Overwrites the local copy if
+  // one already exists (e.g. re-downloading to discard local edits and start
+  // fresh from what's on the server).
+  async importCommunityJob(jobId, jobFields, boreholesData) {
+    const jobs = await loadJobs();
+    const boreholes = (boreholesData || []).map(bh => ({
+      ...bh,
+      id: uuid(),
+      entries: (bh.entries || []).map(e => ({ ...e, id: uuid() })),
+      dcpt: bh.dcpt || [],
+      fc:   bh.fc   || [],
+      createdAt: Date.now(),
+    }));
+    const i = jobs.findIndex(j => j.id === jobId);
+    const job = { ...jobFields, id: jobId, boreholes, createdAt: i >= 0 ? jobs[i].createdAt : Date.now() };
+    if (i >= 0) jobs[i] = job; else jobs.unshift(job);
     await saveJobs(jobs);
     return job;
   },

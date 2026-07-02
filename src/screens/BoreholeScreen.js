@@ -10,6 +10,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import { DB } from '../storage/db';
 import { renderBorehole } from '../renderer/pdfRenderer';
+import DateField from '../components/DateField';
 
 // Convert Uint8Array → base64 string (replacement for pdf-lib's non-public encodeToBase64)
 function uint8ToBase64(bytes) {
@@ -24,10 +25,15 @@ function uint8ToBase64(bytes) {
 const C = { navy:'#1F3A5F', blue:'#2E75B6', bg:'#F8FAFC', white:'#fff',
             border:'#CBD5E1', muted:'#64748B', text:'#1E293B', red:'#DC2626', green:'#16A34A' };
 
+function todayISO() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
 const BH_FIELDS = [
   ['Borehole Number*',         'boreholeNumber',   'e.g. BH-01'],
-  ['Date',                     'date',             'e.g. 2024-04-22'],
-  ['Datum',                    'datum',            'e.g. AHD'],
+  ['Date',                     'date',             'Tap to set date'],
+  ['Datum',                    'datum',            'e.g. Ground Elevation'],
   ['Figure Number',            'figureNumber',     'e.g. A.01'],
   ['Ground Elevation (m AHD)', 'groundElevation',  'e.g. 52.30'],
   ['Groundwater Depth (m)',    'groundwaterDepth', 'e.g. 5.2'],
@@ -36,7 +42,9 @@ const BH_FIELDS = [
 ];
 
 export default function BoreholeScreen({ route, navigation }) {
-  const { jobId, bhId, readOnly = false, communityBh } = route.params;
+  const { jobId, bhId, readOnly: readOnlyParam = false, communityBh } = route.params;
+  // Community boreholes are read-only here too — edit locally, then re-publish.
+  const readOnly = readOnlyParam || !!communityBh;
   const [job,       setJob]       = useState(null);
   const [borehole,  setBorehole]  = useState(communityBh || null);
   const [entries,   setEntries]   = useState(communityBh?.entries || []);
@@ -72,8 +80,8 @@ export default function BoreholeScreen({ route, navigation }) {
     if (!borehole) return;
     setForm({
       boreholeNumber:   borehole.boreholeNumber   || '',
-      date:             borehole.date             || '',
-      datum:            borehole.datum            || 'AHD',
+      date:             borehole.date             || todayISO(),
+      datum:            borehole.datum            || 'Ground Elevation',
       figureNumber:     borehole.figureNumber     || '',
       groundElevation:  borehole.groundElevation  || '',
       groundwaterDepth: borehole.groundwaterDepth || '',
@@ -220,7 +228,7 @@ export default function BoreholeScreen({ route, navigation }) {
       {tab === 'entries' && (
         <FlatList
           data={sorted}
-          keyExtractor={e => e.id}
+          keyExtractor={(e, i) => e.id || `${e.depthFrom ?? ''}-${e.depthTo ?? ''}-${i}`}
           contentContainerStyle={s.list}
           ListEmptyComponent={<View style={s.empty}><Text style={s.emptyTxt}>No entries yet</Text></View>}
           renderItem={({ item:e }) => (
@@ -465,9 +473,13 @@ export default function BoreholeScreen({ route, navigation }) {
               {BH_FIELDS.map(([lbl,key,ph]) => (
                 <View key={key} style={s.field}>
                   <Text style={s.label}>{lbl}</Text>
-                  <TextInput style={s.input} placeholder={ph} value={form[key]||''}
-                    keyboardType={['groundwaterDepth','groundElevation'].includes(key)?'decimal-pad':'default'}
-                    onChangeText={v => setForm(f=>({...f,[key]:v}))} />
+                  {key === 'date' ? (
+                    <DateField value={form.date} onChange={v => setForm(f => ({ ...f, date: v }))} />
+                  ) : (
+                    <TextInput style={s.input} placeholder={ph} value={form[key]||''}
+                      keyboardType={['groundwaterDepth','groundElevation'].includes(key)?'decimal-pad':'default'}
+                      onChangeText={v => setForm(f=>({...f,[key]:v}))} />
+                  )}
                 </View>
               ))}
             </ScrollView>

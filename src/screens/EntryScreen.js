@@ -2,9 +2,24 @@ import React, { useState, useEffect } from 'react';
 import {
   View, Text, ScrollView, TextInput, TouchableOpacity, Modal,
   StyleSheet, Alert, SafeAreaView, KeyboardAvoidingView, Platform,
-  ActivityIndicator,
+  ActivityIndicator, Image, ActionSheetIOS,
 } from 'react-native';
+import * as FileSystem from 'expo-file-system/legacy';
 import { DB } from '../storage/db';
+
+// Photos live in the app's own document directory so they survive the OS
+// clearing the picker's temp cache. Only local file:// paths are stored on
+// the entry for now — publishing to Community does NOT upload these (a
+// device-local path is meaningless on another phone), so photos currently
+// stay on-device only. Uploading them to cloud storage so they can be
+// centrally collected (e.g. for future AI training) is tracked as follow-up
+// work, not done here.
+const PHOTOS_DIR = FileSystem.documentDirectory + 'entry_photos/';
+
+async function ensurePhotosDir() {
+  const info = await FileSystem.getInfoAsync(PHOTOS_DIR);
+  if (!info.exists) await FileSystem.makeDirectoryAsync(PHOTOS_DIR, { intermediates: true });
+}
 
 const C = {
   navy:'#1F3A5F', blue:'#2E75B6', bg:'#F8FAFC', white:'#fff',
@@ -317,7 +332,9 @@ function SoilTypePicker({
 
 // ── Main screen ───────────────────────────────────────────────────────────────
 export default function EntryScreen({ route, navigation }) {
-  const { jobId, bhId, entryId, readOnly = false, communityEntry } = route.params;
+  const { jobId, bhId, entryId, readOnly: readOnlyParam = false, communityEntry } = route.params;
+  // Community entries are read-only here too — edit locally, then re-publish.
+  const readOnly = readOnlyParam || !!communityEntry;
   const isEdit = !!entryId || !!communityEntry;
 
   const [depthFrom, setDepthFrom] = useState('');
@@ -354,6 +371,10 @@ export default function EntryScreen({ route, navigation }) {
   const [moisture,    setMoisture]    = useState('');
   const [notes,       setNotes]       = useState('');
   const [remarks,     setRemarks]     = useState('');
+
+  // Photos — array of { uri }. Local file paths only (see PHOTOS_DIR note above).
+  const [photos,      setPhotos]      = useState(communityEntry?.photos || []);
+  const [photoBusy,   setPhotoBusy]   = useState(false);
 
   // Derived
   const title       = composeTitle(pm, geoUnit, sm, smType, andPair);
@@ -480,8 +501,73 @@ export default function EntryScreen({ route, navigation }) {
       setMoisture(e.moisture || '');
       setNotes(e.notes || '');
       setRemarks(e.remarks || '');
+      setPhotos(e.photos || []);
     });
   }, [entryId]);
+
+  // ── Photos ───────────────────────────────────────────────────────────────
+  async function addPhotoFrom(source) {
+    let ImagePicker;
+    try { ImagePicker = require('expo-image-picker'); }
+    catch { Alert.alert('Error', 'expo-image-picker not installed.'); return; }
+
+    try {
+      const perm = source === 'camera'
+        ? await ImagePicker.requestCameraPermissionsAsync()
+        : await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (perm.status !== 'granted') {
+        Alert.alert('Permission denied', `${source === 'camera' ? 'Camera' : 'Photo library'} permission is required.`);
+        return;
+      }
+
+      const result = source === 'camera'
+        ? await ImagePicker.launchCameraAsync({ quality: 0.7 })
+        : await ImagePicker.launchImageLibraryAsync({ quality: 0.7, allowsMultipleSelection: true });
+      if (result.canceled) return;
+
+      setPhotoBusy(true);
+      await ensurePhotosDir();
+      const assets = result.assets || [];
+      const saved = [];
+      for (const asset of assets) {
+        const ext = (asset.uri.split('.').pop() || 'jpg').split('?')[0];
+        const filename = `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+        const dest = PHOTOS_DIR + filename;
+        await FileSystem.copyAsync({ from: asset.uri, to: dest });
+        saved.push({ uri: dest });
+      }
+      setPhotos(prev => [...prev, ...saved]);
+    } catch (e) {
+      Alert.alert('Photo Error', e.message || 'Could not add photo.');
+    } finally {
+      setPhotoBusy(false);
+    }
+  }
+
+  function pickPhoto() {
+    if (Platform.OS === 'ios' && ActionSheetIOS?.showActionSheetWithOptions) {
+      ActionSheetIOS.showActionSheetWithOptions(
+        { options: ['Cancel', 'Take Photo', 'Choose from Library'], cancelButtonIndex: 0 },
+        idx => {
+          if (idx === 1) addPhotoFrom('camera');
+          if (idx === 2) addPhotoFrom('library');
+        }
+      );
+    } else {
+      Alert.alert('Add Photo', 'Choose a source', [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Take Photo', onPress: () => addPhotoFrom('camera') },
+        { text: 'Choose from Library', onPress: () => addPhotoFrom('library') },
+      ]);
+    }
+  }
+
+  function removePhoto(uri) {
+    Alert.alert('Remove Photo', 'Remove this photo from the entry?',
+      [{ text: 'Cancel', style: 'cancel' }, { text: 'Remove', style: 'destructive',
+        onPress: () => setPhotos(prev => prev.filter(p => p.uri !== uri))
+      }]);
+  }
 
   // ── Save ─────────────────────────────────────────────────────────────────
   async function save() {
@@ -501,6 +587,7 @@ export default function EntryScreen({ route, navigation }) {
       soilTypeComponents,
       condition,
       moisture, notes, remarks,
+      photos,
     };
     if (isEdit) await DB.updateEntry(jobId, bhId, entryId, data);
     else        await DB.createEntry(jobId, bhId, data);
@@ -554,6 +641,32 @@ export default function EntryScreen({ route, navigation }) {
             <TouchableOpacity style={s.refBtn} onPress={fetchReference}>
               <Text style={s.refBtnTxt}>🔍 Reference Nearby Boreholes</Text>
             </TouchableOpacity>
+          )}
+        </Section>
+
+        {/* Photos */}
+        <Section title="Photos">
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={s.photoRow}>
+            {photos.map(p => (
+              <View key={p.uri} style={s.photoThumbWrap}>
+                <Image source={{ uri: p.uri }} style={s.photoThumb} />
+                {!readOnly && (
+                  <TouchableOpacity style={s.photoRemoveBtn} onPress={() => removePhoto(p.uri)}>
+                    <Text style={s.photoRemoveTxt}>✕</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            ))}
+            {!readOnly && (
+              <TouchableOpacity style={s.photoAddBtn} onPress={pickPhoto} disabled={photoBusy}>
+                {photoBusy
+                  ? <ActivityIndicator color={C.blue} />
+                  : <Text style={s.photoAddTxt}>＋{'\n'}Add{'\n'}Photo</Text>}
+              </TouchableOpacity>
+            )}
+          </ScrollView>
+          {photos.length === 0 && readOnly && (
+            <Text style={s.photoEmptyTxt}>No photos attached.</Text>
           )}
         </Section>
 
@@ -741,6 +854,18 @@ const s = StyleSheet.create({
   input:        { borderWidth:1.5, borderColor:C.border, borderRadius:8,
                   padding:10, fontSize:14, backgroundColor:C.white, color:C.text },
   textarea:     { minHeight:72, textAlignVertical:'top' },
+
+  // Photos
+  photoRow:        { flexDirection:'row' },
+  photoThumbWrap:  { marginRight:10, position:'relative' },
+  photoThumb:      { width:84, height:84, borderRadius:8, backgroundColor:C.border },
+  photoRemoveBtn:  { position:'absolute', top:-6, right:-6, backgroundColor:C.red,
+                     width:22, height:22, borderRadius:11, alignItems:'center', justifyContent:'center' },
+  photoRemoveTxt:  { color:'#fff', fontSize:12, fontWeight:'bold' },
+  photoAddBtn:     { width:84, height:84, borderRadius:8, borderWidth:1.5, borderColor:C.border,
+                     borderStyle:'dashed', alignItems:'center', justifyContent:'center', backgroundColor:C.white },
+  photoAddTxt:     { color:C.blue, fontSize:11, fontWeight:'600', textAlign:'center', lineHeight:14 },
+  photoEmptyTxt:   { fontSize:12, color:C.muted, fontStyle:'italic' },
 
   // Tier layout
   tierRow:      { flexDirection:'row', alignItems:'center', marginTop:14, marginBottom:6 },

@@ -597,6 +597,184 @@ function pageClipEntries(entries, pageStart, pageEnd) {
   return result;
 }
 
+// ─── Photo log pages ──────────────────────────────────────────────────────────
+// Appended after the standard log pages for a borehole: up to 3 photos per
+// page, each captioned "Fig. N — depth range" + the entry's soil description.
+// Figure numbers restart at 1 per borehole (there's no existing cross-page
+// figure counter to hook into elsewhere in the report).
+
+function wrapToWidth(text, font, size, maxWidth) {
+  const words = (text || '').split(/\s+/).filter(Boolean);
+  const lines = [];
+  let cur = '';
+  for (const w of words) {
+    const trial = cur ? cur + ' ' + w : w;
+    if (font.widthOfTextAtSize(trial, size) <= maxWidth) cur = trial;
+    else { if (cur) lines.push(cur); cur = w; }
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
+
+async function embedPhoto(finalDoc, uri) {
+  // pdf-lib accepts a base64 string directly (no need to hand-decode it —
+  // atob isn't available in the RN/Hermes runtime anyway).
+  const b64 = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
+  try { return await finalDoc.embedJpg(b64); }
+  catch { return await finalDoc.embedPng(b64); }
+}
+
+async function drawPhotoPages(finalDoc, job, borehole) {
+  const entries = [...(borehole.entries || [])].sort((a, b) => a.depthFrom - b.depthFrom);
+  const shots = [];
+  for (const e of entries) {
+    for (const p of (e.photos || [])) {
+      if (p?.uri) shots.push({ uri: p.uri, entry: e });
+    }
+  }
+  if (!shots.length) return;
+
+  const PER_PAGE  = 3;
+  const totalPages = Math.ceil(shots.length / PER_PAGE);
+  const bhNum = borehole.boreholeNumber || 'BH';
+
+  const MARGIN_X = 36, GAP = 16;
+  const HEADER_TO_GRID_GAP = 26; // breathing room below the blue divider, matches the approved mockup
+  const FOOTER_Y = 60;
+  const colW = (K.PW - MARGIN_X * 2 - GAP * 2) / 3;
+  const imgH = colW * 0.75; // fixed 4:3 box — every photo fits the same frame, not just the same column width
+
+  for (let pg = 0; pg < totalPages; pg++) {
+    const page = finalDoc.addPage([K.PW, K.PH]);
+    const fonts = {
+      n:  await finalDoc.embedFont(StandardFonts.Helvetica),
+      b:  await finalDoc.embedFont(StandardFonts.HelveticaBold),
+      i:  await finalDoc.embedFont(StandardFonts.HelveticaOblique),
+      bi: await finalDoc.embedFont(StandardFonts.HelveticaBoldOblique),
+    };
+
+    function draw(x, y, s, { sz = 9, font = fonts.n, col = K.C_BLACK, align = 'left' } = {}) {
+      const str = String(s);
+      let drawX = x;
+      if (align === 'center') drawX = x - font.widthOfTextAtSize(str, sz) / 2;
+      if (align === 'right')  drawX = x - font.widthOfTextAtSize(str, sz);
+      page.drawText(str, { x: drawX, y, size: sz, font, color: rgb(...col) });
+    }
+
+    // ── Header (matches the main log's header style/fields) ──
+    const titleLabel = 'Test Hole Log:  ';
+    const titleW = fonts.bi.widthOfTextAtSize(titleLabel, 14);
+    draw(K.HDR_LABEL_X, K.PH - 40, titleLabel, { sz:14, font:fonts.bi, col:K.C_BLUE });
+    draw(K.HDR_LABEL_X + titleW, K.PH - 40, `${bhNum}  —  Photo Log`, { sz:14, font:fonts.bi, col:K.C_BLUE });
+
+    const hdrRows = [
+      ['File:',          job.jobNumber    || ''],
+      ['Project:',       job.projectName  || ''],
+      ['Client:',        job.clientName   || ''],
+      ['Site Location:', job.locationName || job.siteLocation || ''],
+    ];
+    let hy = K.PH - 58;
+    for (const [lbl, val] of hdrRows) {
+      const lw = fonts.bi.widthOfTextAtSize(lbl + ' ', 9);
+      draw(K.HDR_LABEL_X, hy, lbl, { sz:9, font:fonts.bi });
+      draw(K.HDR_LABEL_X + lw, hy, val, { sz:9 });
+      hy -= 13;
+    }
+    const headerDividerY = hy - 4;
+    page.drawLine({ start:{x:K.X.left,y:headerDividerY}, end:{x:K.X.right,y:headerDividerY}, thickness:1, color:rgb(...K.C_BLUE) });
+    const GRID_TOP = headerDividerY - HEADER_TO_GRID_GAP;
+
+    // ── Photo grid ──
+    for (let i = 0; i < PER_PAGE; i++) {
+      const idx = pg * PER_PAGE + i;
+      if (idx >= shots.length) break;
+      const shot = shots[idx];
+      const colX = MARGIN_X + i * (colW + GAP);
+      const imgY = GRID_TOP - imgH;
+
+      let img;
+      try {
+        img = await embedPhoto(finalDoc, shot.uri);
+      } catch {
+        // Skip a photo that fails to load/decode rather than aborting the
+        // whole report — a missing/corrupt image shouldn't block the export.
+        page.drawRectangle({ x:colX, y:imgY, width:colW, height:imgH, borderWidth:0.5, borderColor:rgb(...K.C_GRAY) });
+        draw(colX + colW/2, imgY + imgH/2, 'Photo unavailable', { sz:8, col:K.C_GRAY, align:'center' });
+        img = null;
+      }
+
+      if (img) {
+        const scale = Math.min(colW / img.width, imgH / img.height);
+        const drawW = img.width * scale, drawH = img.height * scale;
+        const dx = colX + (colW - drawW) / 2, dyImg = imgY + (imgH - drawH) / 2;
+        page.drawImage(img, { x:dx, y:dyImg, width:drawW, height:drawH });
+        page.drawRectangle({ x:colX, y:imgY, width:colW, height:imgH, borderWidth:0.5, borderColor:rgb(...K.C_BLACK) });
+      }
+
+      // Caption: Fig N + depth range, soil type, moisture/condition, then
+      // wrapped description — the "standard soil layer info" alongside depth.
+      const figNum   = idx + 1;
+      const df = parseFloat(shot.entry.depthFrom), dt = parseFloat(shot.entry.depthTo);
+      const depthLbl = (!isNaN(df) && !isNaN(dt)) ? `${df.toFixed(1)}–${dt.toFixed(1)}m` : '';
+      let capY = imgY - 13;
+      draw(colX, capY, `Fig. ${figNum}  —  ${depthLbl}`, { sz:9, font:fonts.b, col:K.C_BLUE });
+      capY -= 13;
+
+      const soilComp = Array.isArray(shot.entry.soilTypeComponents) && shot.entry.soilTypeComponents.length
+        ? shot.entry.soilTypeComponents.join(', ')
+        : (shot.entry.soilType || '');
+      if (soilComp) {
+        draw(colX, capY, 'Soil: ', { sz:7.5, font:fonts.b });
+        draw(colX + fonts.b.widthOfTextAtSize('Soil: ', 7.5), capY, soilComp, { sz:7.5 });
+        capY -= 10;
+      }
+
+      const moistCond = [shot.entry.moisture, shot.entry.condition].filter(Boolean).join(' / ');
+      if (moistCond) {
+        const lbl = 'Moisture / Cond.: ';
+        draw(colX, capY, lbl, { sz:7.5, font:fonts.b });
+        draw(colX + fonts.b.widthOfTextAtSize(lbl, 7.5), capY, moistCond, { sz:7.5 });
+        capY -= 10;
+      }
+
+      capY -= 2;
+      const descLines = wrapToWidth(shot.entry.description || '', fonts.n, 7, colW).slice(0, 3);
+      for (const ln of descLines) {
+        draw(colX, capY, ln, { sz:7, col:K.C_GRAY });
+        capY -= 9;
+      }
+    }
+
+    // ── Footer (matches the main log's footer style/fields) — two rows,
+    // each of the 3 label/value pairs spread evenly across the full width.
+    const lbV  = borehole.loggedBy    || job.loggedBy || '';
+    const mtV  = borehole.method      || job.method   || '';
+    const dtV  = borehole.startDate   || borehole.date || '';
+    const dmV  = borehole.datum       || '';
+    const figV = borehole.figureNumber || '';
+    const sz = 9;
+
+    function drawFooterRow(y, triplet) {
+      const widths = triplet.map(([lbl, val]) =>
+        fonts.b.widthOfTextAtSize(lbl + ' ', sz) + fonts.n.widthOfTextAtSize(val, sz)
+      );
+      const totalW = widths.reduce((a, b) => a + b, 0);
+      const gap = Math.max(0, ((K.X.right - K.X.left) - totalW) / (triplet.length - 1));
+      let x = K.X.left;
+      triplet.forEach(([lbl, val], i) => {
+        draw(x, y, lbl, { sz, font:fonts.b });
+        x += fonts.b.widthOfTextAtSize(lbl + ' ', sz);
+        draw(x, y, val, { sz });
+        x += fonts.n.widthOfTextAtSize(val, sz) + gap;
+      });
+    }
+
+    page.drawLine({ start:{x:K.X.left,y:FOOTER_Y+22}, end:{x:K.X.right,y:FOOTER_Y+22}, thickness:0.5, color:rgb(...K.C_GRAY) });
+    drawFooterRow(FOOTER_Y + 8,  [['Logged:', lbV], ['Method:', mtV], ['Date:', dtV]]);
+    drawFooterRow(FOOTER_Y - 6,  [['Datum:', dmV], ['Fig No:', figV], ['Page:', `${pg+1} of ${totalPages}`]]);
+  }
+}
+
 // ─── Main render entry point ──────────────────────────────────────────────────
 export async function renderBorehole(job, borehole) {
   // Load template PDF from assets (avoids large JS string literal issues with Hermes)
@@ -680,6 +858,10 @@ export async function renderBorehole(job, borehole) {
     drawElevations(pageEntries, isNaN(gndElev) ? null : gndElev, pageStart, pageEnd);
     if (pgIdx === nPages - 1) drawEob(totalDepth, descBot, isNaN(gndElev) ? null : gndElev);
   }
+
+  // Photo appendix — one or more extra pages after the log, only if any
+  // entry on this borehole actually has photos attached.
+  await drawPhotoPages(finalDoc, job, borehole);
 
   return await finalDoc.save();
 }
