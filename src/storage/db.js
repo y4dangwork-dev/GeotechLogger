@@ -1,6 +1,23 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-const JOBS_KEY = '@geotechlogger:jobs';
+const JOBS_KEY     = '@geotechlogger:jobs';
+const SETTINGS_KEY = '@geotechlogger:settings';
+
+const DEFAULT_SETTINGS = {
+  nearbyRefEnabled: false,
+  nearbyRefRadius:  3,   // km: 1 | 3 | 5
+};
+
+// Haversine distance in metres between two lat/lng points
+function haversineM(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat/2)**2 +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
 
 function uuid() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
@@ -21,6 +38,18 @@ async function saveJobs(jobs) {
 }
 
 export const DB = {
+  async getSettings() {
+    try {
+      const raw = await AsyncStorage.getItem(SETTINGS_KEY);
+      return raw ? { ...DEFAULT_SETTINGS, ...JSON.parse(raw) } : { ...DEFAULT_SETTINGS };
+    } catch { return { ...DEFAULT_SETTINGS }; }
+  },
+
+  async updateSettings(patch) {
+    const cur = await DB.getSettings();
+    await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify({ ...cur, ...patch }));
+  },
+
   async getJobs() { return loadJobs(); },
 
   async createJob(data) {
@@ -171,5 +200,41 @@ export const DB = {
     if (!bh) return;
     bh.entries = (bh.entries||[]).filter(e => e.id !== entryId);
     await saveJobs(jobs);
+  },
+
+  // Return entries from OTHER boreholes whose depth range overlaps [depthFrom, depthTo]
+  // within 1 km, 5 km, or 10 km of the given coordinates.
+  // Results are sorted by distance ascending, each item has:
+  //   { distanceM, radiusBucket, bhName, entry }
+  // maxRadiusKm: 1 | 3 | 5 — smart priority: closest first, then most overlap
+  async getNearbyEntries(lat, lng, depthFrom, depthTo, excludeBhId, maxRadiusKm = 3) {
+    if (lat == null || lng == null) return [];
+    const maxM = maxRadiusKm * 1000;
+    const jobs = await loadJobs();
+    const results = [];
+    for (const job of jobs) {
+      for (const bh of job.boreholes || []) {
+        if (bh.id === excludeBhId) continue;
+        const bhLat = bh.latitude ?? bh.lat;
+        const bhLng = bh.longitude ?? bh.lng;
+        if (bhLat == null || bhLng == null) continue;
+        const dist = haversineM(lat, lng, bhLat, bhLng);
+        if (dist > maxM) continue;
+        const bucket = dist <= 1000 ? '< 1 km' : dist <= 3000 ? '< 3 km' : '< 5 km';
+        for (const entry of bh.entries || []) {
+          if (entry.depthFrom >= depthTo || entry.depthTo <= depthFrom) continue;
+          const overlapM   = Math.min(entry.depthTo, depthTo) - Math.max(entry.depthFrom, depthFrom);
+          const overlapPct = overlapM / (depthTo - depthFrom);
+          results.push({
+            distanceM: dist, bucket,
+            bhNumber:  bh.boreholeNumber || bh.id,
+            jobNumber: job.jobNumber || job.projectName || '',
+            entry, overlapPct,
+          });
+        }
+      }
+    }
+    results.sort((a, b) => a.distanceM - b.distanceM || b.overlapPct - a.overlapPct);
+    return results;
   },
 };

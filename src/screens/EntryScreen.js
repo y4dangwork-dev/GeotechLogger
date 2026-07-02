@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import {
   View, Text, ScrollView, TextInput, TouchableOpacity, Modal,
   StyleSheet, Alert, SafeAreaView, KeyboardAvoidingView, Platform,
+  ActivityIndicator,
 } from 'react-native';
 import { DB } from '../storage/db';
 
@@ -322,6 +323,15 @@ export default function EntryScreen({ route, navigation }) {
   const [depthFrom, setDepthFrom] = useState('');
   const [depthTo,   setDepthTo]   = useState('');
 
+  // Nearby reference
+  const [nearbyEnabled,  setNearbyEnabled]  = useState(false);
+  const [nearbyRadius,   setNearbyRadius]   = useState(3);
+  const [bhCoords,       setBhCoords]       = useState(null);   // { lat, lng }
+  const [refResults,     setRefResults]     = useState([]);     // suggestions
+  const [refLoading,     setRefLoading]     = useState(false);
+  const [refVisible,     setRefVisible]     = useState(false);
+  const [gpsLoading,     setGpsLoading]     = useState(false);  // capturing GPS
+
   // Soil type
   const [pm,        setPm]        = useState('');
   const [geoUnit,   setGeoUnit]   = useState('');
@@ -367,6 +377,86 @@ export default function EntryScreen({ route, navigation }) {
     if (c.stiffness) setStiffness(c.stiffness);
     if (c.bedrock)   setBedrock(c.bedrock);
     if (c.color)     setColor(c.color);
+  }
+
+  useEffect(() => {
+    // Load settings + borehole coordinates for nearby reference
+    DB.getSettings().then(s => {
+      setNearbyEnabled(s.nearbyRefEnabled);
+      setNearbyRadius(s.nearbyRefRadius);
+    });
+    DB.getBorehole(jobId, bhId).then(bh => {
+      if (bh?.latitude != null) setBhCoords({ lat: bh.latitude, lng: bh.longitude });
+    });
+  }, []);
+
+  async function fetchReference() {
+    const df = parseFloat(depthFrom), dt = parseFloat(depthTo);
+    if (isNaN(df) || isNaN(dt) || dt <= df) {
+      Alert.alert('Reference', 'Please enter valid From and To depths first.');
+      return;
+    }
+    if (!bhCoords) {
+      // Show the card in "no-GPS" state so user can capture location inline
+      setRefResults([]);
+      setRefVisible(true);
+      return;
+    }
+    setRefLoading(true);
+    setRefVisible(true);
+    const results = await DB.getNearbyEntries(
+      bhCoords.lat, bhCoords.lng, df, dt, bhId, nearbyRadius
+    );
+    setRefResults(results);
+    setRefLoading(false);
+  }
+
+  async function captureGPS() {
+    setGpsLoading(true);
+    try {
+      let Location;
+      try { Location = require('expo-location'); }
+      catch { Alert.alert('Error', 'expo-location not installed.'); setGpsLoading(false); return; }
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== 'granted') {
+        Alert.alert('Permission denied', 'Location permission is required.');
+        setGpsLoading(false);
+        return;
+      }
+      const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+      const coords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+      await DB.updateBorehole(jobId, bhId, { latitude: coords.lat, longitude: coords.lng });
+      setBhCoords(coords);
+      // Now run the reference query with the new coords
+      const df = parseFloat(depthFrom), dt = parseFloat(depthTo);
+      if (!isNaN(df) && !isNaN(dt) && dt > df) {
+        setRefLoading(true);
+        const results = await DB.getNearbyEntries(coords.lat, coords.lng, df, dt, bhId, nearbyRadius);
+        setRefResults(results);
+        setRefLoading(false);
+      }
+    } catch (e) {
+      Alert.alert('GPS Error', e.message || 'Could not get location.');
+    }
+    setGpsLoading(false);
+  }
+
+  function applyReference(item) {
+    restore(item.entry.soilTypeComponents);
+    if (item.entry.color)   setColor(item.entry.color);
+    if (item.entry.moisture) setMoisture(item.entry.moisture);
+    if (item.entry.condition) {
+      // parse condition back into density/stiffness/bedrock
+      const parts = (item.entry.condition || '').split(', ');
+      if (DENSITIES.includes(parts[0]))     setDensity(parts[0]);
+      if (STIFFNESSES.includes(parts[0]) || STIFFNESSES.includes(parts[1])) {
+        const s = parts.find(p => STIFFNESSES.includes(p));
+        if (s) setStiffness(s);
+      }
+      const b = parts.find(p => BEDROCK_CONDS.includes(p));
+      if (b) setBedrock(b);
+    }
+    setRefVisible(false);
   }
 
   useEffect(() => {
@@ -460,7 +550,58 @@ export default function EntryScreen({ route, navigation }) {
                 placeholderTextColor="#94A3B8" />
             </View>
           </View>
+          {nearbyEnabled && !readOnly && (
+            <TouchableOpacity style={s.refBtn} onPress={fetchReference}>
+              <Text style={s.refBtnTxt}>🔍 Reference Nearby Boreholes</Text>
+            </TouchableOpacity>
+          )}
         </Section>
+
+        {/* Reference suggestion card */}
+        {refVisible && (
+          <View style={s.refCard}>
+            <View style={s.refCardHeader}>
+              <Text style={s.refCardTitle}>Nearby Borehole Reference</Text>
+              <TouchableOpacity onPress={() => setRefVisible(false)}>
+                <Text style={s.refCardClose}>✕</Text>
+              </TouchableOpacity>
+            </View>
+            {!bhCoords ? (
+              <View style={s.refNoGps}>
+                <Text style={s.refNoGpsTxt}>📍 This borehole has no GPS location.</Text>
+                <Text style={s.refNoGpsSub}>Capture your current position to find nearby boreholes. Works offline.</Text>
+                <TouchableOpacity style={s.refGpsBtn} onPress={captureGPS} disabled={gpsLoading}>
+                  {gpsLoading
+                    ? <ActivityIndicator color="#fff" size="small" />
+                    : <Text style={s.refGpsBtnTxt}>📡 Use My GPS Location</Text>
+                  }
+                </TouchableOpacity>
+              </View>
+            ) : refLoading ? (
+              <Text style={s.refCardEmpty}>Searching…</Text>
+            ) : refResults.length === 0 ? (
+              <Text style={s.refCardEmpty}>No nearby entries found within {nearbyRadius} km.</Text>
+            ) : (
+              <>
+                {refResults.slice(0, 3).map((item, i) => (
+                  <View key={i} style={[s.refItem, i === 0 && s.refItemNearest]}>
+                    <View style={{flex:1}}>
+                      <View style={s.refItemHeader}>
+                        <Text style={s.refItemBh}>{item.jobNumber}  ·  {item.bhNumber}</Text>
+                        {i === 0 && <View style={s.nearestBadge}><Text style={s.nearestBadgeTxt}>Nearest</Text></View>}
+                      </View>
+                      <Text style={s.refItemDist}>{item.bucket}  ·  {item.entry.depthFrom}–{item.entry.depthTo} m</Text>
+                      <Text style={s.refItemDesc} numberOfLines={2}>{item.entry.description || item.entry.soilType}</Text>
+                    </View>
+                    <TouchableOpacity style={s.refApplyBtn} onPress={() => applyReference(item)}>
+                      <Text style={s.refApplyTxt}>Apply</Text>
+                    </TouchableOpacity>
+                  </View>
+                ))}
+              </>
+            )}
+          </View>
+        )}
 
         {/* Soil Type */}
         <Section title="Soil Type">
@@ -561,6 +702,34 @@ const s = StyleSheet.create({
   readOnlyBanner:    { backgroundColor:'#FEF9C3', borderRadius:8, padding:10, marginBottom:12 },
   readOnlyBannerTxt: { color:'#92400E', fontSize:13, textAlign:'center' },
 
+  // Reference button + card
+  refBtn:         { marginTop:10, paddingVertical:8, paddingHorizontal:14, borderRadius:8,
+                    borderWidth:1, borderColor:C.blue, alignSelf:'flex-start' },
+  refBtnTxt:      { color:C.blue, fontSize:12, fontWeight:'600' },
+  refCard:        { backgroundColor:'#EFF6FF', borderRadius:10, borderWidth:1,
+                    borderColor:'#BFDBFE', padding:12, marginBottom:14 },
+  refCardHeader:  { flexDirection:'row', justifyContent:'space-between', alignItems:'center', marginBottom:10 },
+  refCardTitle:   { fontSize:13, fontWeight:'700', color:C.navy },
+  refCardClose:   { fontSize:16, color:C.muted, paddingHorizontal:6 },
+  refCardEmpty:   { fontSize:13, color:C.muted, textAlign:'center', paddingVertical:8 },
+  refItem:        { flexDirection:'row', alignItems:'center', backgroundColor:'#fff',
+                    borderRadius:8, padding:10, marginBottom:8, borderWidth:1, borderColor:'#BFDBFE' },
+  refItemNearest: { borderColor:C.blue, borderWidth:2, backgroundColor:'#F0F7FF',
+                    borderLeftWidth:4, borderLeftColor:C.blue },
+  refItemHeader:  { flexDirection:'row', alignItems:'center', gap:8, marginBottom:2 },
+  refItemBh:      { fontSize:12, fontWeight:'700', color:C.navy },
+  nearestBadge:   { backgroundColor:C.blue, borderRadius:4, paddingHorizontal:6, paddingVertical:1 },
+  nearestBadgeTxt:{ color:'#fff', fontSize:10, fontWeight:'700' },
+  refItemDist:    { fontSize:11, color:C.muted, marginBottom:2 },
+  refItemDesc:    { fontSize:12, color:C.text, marginTop:1 },
+  refApplyBtn:    { backgroundColor:C.blue, borderRadius:6, paddingHorizontal:12, paddingVertical:6, marginLeft:10 },
+  refApplyTxt:    { color:'#fff', fontSize:12, fontWeight:'600' },
+  refNoGps:       { alignItems:'center', paddingVertical:8 },
+  refNoGpsTxt:    { fontSize:13, fontWeight:'600', color:C.navy, marginBottom:4 },
+  refNoGpsSub:    { fontSize:11, color:C.muted, textAlign:'center', marginBottom:12, lineHeight:16 },
+  refGpsBtn:      { backgroundColor:C.navy, borderRadius:8, paddingHorizontal:20, paddingVertical:10, minWidth:180, alignItems:'center' },
+  refGpsBtnTxt:   { color:'#fff', fontSize:13, fontWeight:'600' },
+
   scroll:       { backgroundColor:C.bg },
   content:      { padding:14, paddingBottom:56 },
   section:      { marginBottom:18 },
@@ -611,15 +780,15 @@ const s = StyleSheet.create({
   previewDivider:   { height:1, backgroundColor:'rgba(255,255,255,0.15)', marginBottom:10 },
   previewDesc:      { fontSize:13, color:'rgba(255,255,255,0.88)', lineHeight:20 },
 
-  bigSaveBtn:   { backgroundColor:C.navy, borderRadius:10, padding:16,
-                  alignItems:'center', marginTop:8 },
-  bigSaveTxt:   { color:'#fff', fontWeight:'bold', fontSize:15 },
+  bigSaveBtn:   { backgroundColor:C.blue, borderRadius:12, paddingVertical:16,
+                  alignItems:'center', marginTop:8, marginBottom:8 },
+  bigSaveTxt:   { color:'#fff', fontSize:16, fontWeight:'800' },
 
   // Dropdown
-  ddWrap:       { marginTop:2 },
+  ddWrap:       { marginBottom:4 },
   ddBtn:        { flexDirection:'row', alignItems:'center', borderWidth:1.5,
-                  borderColor:C.border, borderRadius:8, paddingHorizontal:12,
-                  paddingVertical:11, backgroundColor:C.white },
+                  borderColor:C.border, borderRadius:8, padding:11,
+                  backgroundColor:C.white },
   ddDisabled:   { opacity:0.6 },
   ddBtnTxt:     { flex:1, fontSize:14, color:C.text },
   ddPlaceholder:{ color:'#94A3B8' },
@@ -651,7 +820,7 @@ const s = StyleSheet.create({
   othersBack:   { flex:1, paddingVertical:11, borderWidth:1.5, borderColor:C.border,
                   borderRadius:8, alignItems:'center' },
   othersBackTxt:{ color:C.muted, fontWeight:'600' },
-  othersOk:     { flex:1, paddingVertical:11, backgroundColor:C.navy,
+  othersOk:     { flex:1, paddingVertical:11, backgroundColor:C.blue,
                   borderRadius:8, alignItems:'center' },
-  othersOkTxt:  { color:'#fff', fontWeight:'bold' },
+  othersOkTxt:  { color:'#fff', fontWeight:'600' },
 });

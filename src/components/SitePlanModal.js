@@ -196,7 +196,7 @@ function cornerIcon() {
     html:'<div style="width:44px;height:44px;position:relative;cursor:crosshair">' +
            '<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);' +
                        'width:10px;height:10px;border-radius:50%;' +
-                       'background:#fff;border:2px solid #2E75B6;' +
+                       'background:#fff;border:2px solid #DC2626;' +
                        'box-shadow:0 1px 3px rgba(0,0,0,0.4)"></div>' +
          '</div>',
     iconSize:[44,44], iconAnchor:[22,22]
@@ -228,42 +228,60 @@ function syncHandlesToEdges() {
   postMsg({type:'bboxUpdating', bbox:customBbox});
 }
 
+// PDF map-area: page(1056-3) × (816-3-0.55×96-0.9×96) = 1053×674
+var CROP_RATIO = 1053 / 674;  // width ÷ height — must match buildPdfHtml layout
+
+/* Snap cropE so the box has exactly CROP_RATIO screen-pixel aspect ratio,
+   keeping cropN/cropS/cropW fixed. Called after every corner dragend. */
+function snapAspectRatio() {
+  var nwPt = map.latLngToContainerPoint([cropN, cropW]);
+  var swPt = map.latLngToContainerPoint([cropS, cropW]);
+  var hPx  = Math.abs(nwPt.y - swPt.y);
+  var wPx  = hPx * CROP_RATIO;
+  cropE = map.containerPointToLatLng(L.point(nwPt.x + wPx, nwPt.y)).lng;
+  syncHandlesToEdges();
+}
+
 function showCropBox() {
   hideCropBox();
-  var b = map.getBounds();
-  var pad = 0.18;
-  var dlat=(b.getNorth()-b.getSouth())*pad, dlng=(b.getEast()-b.getWest())*pad;
-  cropN=b.getNorth()-dlat; cropS=b.getSouth()+dlat;
-  cropE=b.getEast()-dlng;  cropW=b.getWest()+dlng;
+  // Initialise at correct aspect ratio using screen-pixel coordinates
+  var mapSize = map.getSize();
+  var cPt  = map.latLngToContainerPoint(map.getCenter());
+  var hPx  = mapSize.y * 0.64;
+  var wPx  = hPx * CROP_RATIO;
+  var nwLL = map.containerPointToLatLng(L.point(cPt.x - wPx / 2, cPt.y - hPx / 2));
+  var seLL = map.containerPointToLatLng(L.point(cPt.x + wPx / 2, cPt.y + hPx / 2));
+  cropN = nwLL.lat; cropW = nwLL.lng;
+  cropS = seLL.lat; cropE = seLL.lng;
 
   cropRect = L.rectangle([[cropS,cropW],[cropN,cropE]], {
-    color:'#2E75B6', weight:2.5, dashArray:'7 4',
-    fillColor:'rgba(46,117,182,0.07)', fillOpacity:1, interactive:false
+    color:'#DC2626', weight:2.5, dashArray:'7 4',
+    fillColor:'rgba(220,38,38,0.06)', fillOpacity:1, interactive:false
   }).addTo(map);
   customBbox = { north:cropN, south:cropS, east:cropE, west:cropW };
 
   // NW — controls north & west
   var hNW = L.marker([cropN,cropW], {icon:cornerIcon(), draggable:true, zIndexOffset:1000}).addTo(map);
   hNW.on('drag', function(){ var ll=hNW.getLatLng(); cropN=ll.lat; cropW=ll.lng; enforceMinSize(); syncHandlesToEdges(); });
-  hNW.on('dragend', function(){ postMsg({type:'bboxSet', bbox:customBbox}); });
+  hNW.on('dragend', function(){ snapAspectRatio(); postMsg({type:'bboxSet', bbox:customBbox}); });
   cropHandles.push(hNW);
 
   // NE — controls north & east
   var hNE = L.marker([cropN,cropE], {icon:cornerIcon(), draggable:true, zIndexOffset:1000}).addTo(map);
   hNE.on('drag', function(){ var ll=hNE.getLatLng(); cropN=ll.lat; cropE=ll.lng; enforceMinSize(); syncHandlesToEdges(); });
-  hNE.on('dragend', function(){ postMsg({type:'bboxSet', bbox:customBbox}); });
+  hNE.on('dragend', function(){ snapAspectRatio(); postMsg({type:'bboxSet', bbox:customBbox}); });
   cropHandles.push(hNE);
 
   // SE — controls south & east
   var hSE = L.marker([cropS,cropE], {icon:cornerIcon(), draggable:true, zIndexOffset:1000}).addTo(map);
   hSE.on('drag', function(){ var ll=hSE.getLatLng(); cropS=ll.lat; cropE=ll.lng; enforceMinSize(); syncHandlesToEdges(); });
-  hSE.on('dragend', function(){ postMsg({type:'bboxSet', bbox:customBbox}); });
+  hSE.on('dragend', function(){ snapAspectRatio(); postMsg({type:'bboxSet', bbox:customBbox}); });
   cropHandles.push(hSE);
 
   // SW — controls south & west
   var hSW = L.marker([cropS,cropW], {icon:cornerIcon(), draggable:true, zIndexOffset:1000}).addTo(map);
   hSW.on('drag', function(){ var ll=hSW.getLatLng(); cropS=ll.lat; cropW=ll.lng; enforceMinSize(); syncHandlesToEdges(); });
-  hSW.on('dragend', function(){ postMsg({type:'bboxSet', bbox:customBbox}); });
+  hSW.on('dragend', function(){ snapAspectRatio(); postMsg({type:'bboxSet', bbox:customBbox}); });
   cropHandles.push(hSW);
 
   // Center — move entire box
@@ -866,23 +884,22 @@ const s = StyleSheet.create({
   subtitle:  { color: 'rgba(255,255,255,0.7)', fontSize: 11, marginTop: 1 },
   exportBtn: {
     backgroundColor: C.green, paddingHorizontal: 14, paddingVertical: 8,
-    borderRadius: 8, minWidth: 64, alignItems: 'center',
+    borderRadius:  6,
   },
   exportBtnDisabled: { opacity: 0.6 },
   exportTxt: { color: '#fff', fontWeight: 'bold', fontSize: 13 },
   noGps: {
     flex: 1, backgroundColor: '#F8FAFC',
-    alignItems: 'center', justifyContent: 'center', padding: 40,
+    alignItems: 'center', justifyContent: 'center', padding: 32,
   },
   noGpsIcon: { fontSize: 48, marginBottom: 12 },
   noGpsTxt:  { fontSize: 16, fontWeight: '600', color: C.navy, textAlign: 'center', marginBottom: 8 },
   noGpsSub:  { fontSize: 13, color: C.muted, textAlign: 'center', lineHeight: 20 },
   legendBar: {
     flexDirection: 'row', alignItems: 'center', gap: 16,
-    backgroundColor: C.navy, paddingHorizontal: 16, paddingVertical: 10,
+    backgroundColor: C.navy, paddingHorizontal: 14, paddingVertical: 7,
   },
   legendItem: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   dot:        { width: 10, height: 10, borderRadius: 5 },
-  legendTxt:  { color: '#fff', fontSize: 12 },
-  legendSource: { flex: 1, textAlign: 'right', color: 'rgba(255,255,255,0.5)', fontSize: 10 },
+  legendTxt:   { color: '#fff', fontSize: 12 },
 });
